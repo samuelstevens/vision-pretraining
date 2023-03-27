@@ -46,7 +46,7 @@ class CrossEntropy(torchmetrics.Metric):
         return self.sum_loss / self.total_batches
 
 
-class Map(dict):
+class DotDict(dict):
     def __getattr__(self, attr):
         if attr in self:
             return self[attr]

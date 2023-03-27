@@ -6,6 +6,8 @@ Simple training script for computer vision deep learning models.
 * Saves only the latest and best checkpoints.
 * Minimizes configuration.
 """
+import heapq
+import logging
 import os
 
 import torch
@@ -25,22 +27,20 @@ from swinv2 import SwinTransformerV2
 
 num_classes = 10000
 
-log_every = 10
 
-data_path = "/local/scratch/cv_datasets/inat21/raw"
+data_root = "/local/scratch/cv_datasets/inat21/raw"
 resize_size = (256, 256)
 crop_size = (224, 224)
 global_batch_size = 2048
 gradient_accumulation_steps = 1
 channel_mean = (0.4632, 0.4800, 0.3762)
 channel_std = (0.2375, 0.2291, 0.2474)
-rand_augment = utils.Map(
-    num_ops=2, magnitude=9, interpolations=torchvision.InterpolationMode.BILINEAR
-)
+rand_augment_num_ops = 2
+rand_augment_magnitude = 9
 mixup_alpha = 1.0
 
 # Tiny variants
-swin = utils.Map(
+swin = utils.DotDict(
     img_size=crop_size,
     embed_dim=96,
     depths=(2, 2, 6, 2),
@@ -48,7 +48,7 @@ swin = utils.Map(
     window_size=7,
     drop_path_rate=0.2,
 )
-convnext = utils.Map(
+convnext = utils.DotDict(
     depths=(3, 3, 9, 3),
     dims=(96, 192, 384, 768),
 )
@@ -65,6 +65,14 @@ dtype = "bfloat16"
 ptdtype = getattr(torch, dtype)
 # If we change from bfloat16 to float16, we might need a grad scaler
 ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+
+save_root = "/local/scratch/stevens.994/vision/checkpoints"
+log_every = 10
+n_latest_checkpoints = 3
+n_best_checkpoints = 2
+# Needs to be a key in val_metrics
+# Should also be a value we maximize
+best_metric = "val/acc1"
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -91,12 +99,15 @@ device = f"cuda:{rank}"
 torch.cuda.set_device(device)
 
 local_batch_size = global_batch_size // world_size // gradient_accumulation_steps
-
 step = 0
 
 # -------
 # Logging
 # -------
+
+log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=log_format)
+logger = logging.getLogger(f"Rank {rank}")
 
 val_metrics = torchmetrics.MetricCollection(
     {
@@ -117,23 +128,10 @@ train_metrics = torchmetrics.MetricCollection(
         "train/acc5": torchmetrics.Accuracy(
             task="multiclass", top_k=5, num_classes=num_classes
         ),
-        "train/cross-entropy": utils.CrossEntropy(),
     }
 ).to(device)
 
-
-def log_batch(metrics, **kwargs):
-    if not is_master:
-        return
-
-    wandb.log({**metrics.compute(), **kwargs})
-
-
-def log_epoch(metrics):
-    if not is_master:
-        return
-
-    wandb.log({**metrics.compute(), "epoch": epoch})
+assert best_metric in val_metrics, f"Can't optimize for {best_metric}!"
 
 
 # ----
@@ -147,31 +145,34 @@ def build_dataloader(*, train):
     shuffle = train
 
     # Transforms
-    transform = torch.nn.Sequential()
+    transform = []
     transform.append(transforms.Resize(resize_size, antialias=True))
     if train:
-        transform.append(
-            transforms.RandAugment(
-                num_ops=rand_augment.num_ops,
-                magnitude=rand_augment.magnitude,
-                num_magnitude_bins=10,
-                interpolation=rand_augment.interpolation,
-            )
-        )
-        transform.append(
+        train_transforms = [
             transforms.RandomResizedCrop(
                 crop_size, scale=(0.08, 1.0), ratio=(0.75, 4.0 / 3.0), antialias=True
-            )
-        )
-        transform.append(transforms.RandomHorizontalFlip())
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(
+                num_ops=rand_augment_num_ops,
+                magnitude=rand_augment_magnitude,
+                num_magnitude_bins=10,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            ),
+        ]
+        transform.extend(train_transforms)
     else:
         transform.append(transforms.CenterCrop(crop_size))
-    transform.append(transforms.Normalize(mean=channel_mean, std=channel_std))
-    # TODO: transform = torch.jit.script(transform)
-    transform = transforms.Compose([transforms.ToTensor(), transform])
+    common_transforms = [
+        transforms.PILToTensor(),
+        transforms.ConvertImageDtype(torch.float32),
+        transforms.Normalize(mean=channel_mean, std=channel_std),
+    ]
+    transform.extend(common_transforms)
+    transform = transforms.Compose(transform)
 
     dataset = torchvision.datasets.ImageFolder(
-        os.path.join(data_path, split), transform
+        os.path.join(data_root, split), transform
     )
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
@@ -194,6 +195,7 @@ def build_dataloader(*, train):
 
 class Mixup(nn.Module):
     def __init__(self, alpha):
+        super().__init__()
         self.dist = torch.distributions.Beta(torch.tensor(alpha), torch.tensor(alpha))
 
     @classmethod
@@ -203,9 +205,7 @@ class Mixup(nn.Module):
         y = y.long().view(-1, 1)
         batch, _ = y.shape
         # Fill with 0.0, then set to 1 in the target column
-        return torch.full(
-            (batch, num_classes), 0.0, device=y.device, dtype=y.dtype
-        ).scatter(1, y, 1.0)
+        return torch.full((batch, num_classes), 0.0, device=y.device).scatter(1, y, 1.0)
 
     @torch.no_grad()
     def forward(self, inputs, targets):
@@ -215,7 +215,7 @@ class Mixup(nn.Module):
         inputs_flipped = inputs.flip(0).mul_(1 - lam)
         targets_flipped = targets.flip(0).mul_(1 - lam)
 
-        # Do these ops in-place to save memory.
+        # Do input ops in-place to save memory.
         inputs.mul_(lam).add_(inputs_flipped)
         targets.mul_(lam).add_(targets_flipped)
 
@@ -237,7 +237,7 @@ def get_lr():
 
 @torch.no_grad()
 def val():
-    print(f"Starting epoch {epoch} validation."
+    logger.info(f"Starting epoch {epoch} validation.")
     model.eval()
     val_metrics.reset()
 
@@ -248,12 +248,13 @@ def val():
         val_metrics(outputs, targets)
 
     val_metrics.compute()
-    log_epoch(val_metrics)
-    print(f"Finished epoch {epoch} validation."
+    if is_master:
+        wandb.log({**val_metrics.compute(), "perf/epoch": epoch})
+    logger.info(f"Finished epoch {epoch} validation.")
 
 
 def train():
-    print(f"Starting epoch {epoch} training."
+    logger.info(f"Starting epoch {epoch} training.")
     global step
     model.train()
     mixup = Mixup(alpha=mixup_alpha)
@@ -265,16 +266,16 @@ def train():
         model.require_backward_grad_sync = will_step
 
         inputs, targets = inputs.to(device), targets.to(device)
-        inputs, targets = mixup(inputs, targets)
+        inputs, soft_targets = mixup(inputs, targets)
 
         with ctx:
             outputs = model(inputs)
-        
+
         # Reset every step to calculate batch metrics
         train_metrics.reset()
         train_metrics(outputs, targets)
 
-        loss = loss_fn(outputs, targets)
+        loss = loss_fn(outputs, soft_targets)
         loss = loss / gradient_accumulation_steps
         loss.backward()
 
@@ -291,22 +292,99 @@ def train():
 
         train_metrics.compute()
 
-        if batch % log_every == 0:
+        if batch % log_every == 0 and is_master:
             # Need to use **{} because train/lr isn't a valid variable name
-            log_batch(
-                train_metrics,
-                **{
+            # We can use loss.item() because we don't need to sync it across
+            # all processes since it's going to be noisy anyways.
+            wandb.log(
+                {
+                    **train_metrics.compute(),
                     "train/lr": lr,
+                    "train/cross-entropy": loss.item(),
                     "train/step": step,
                     "perf/total-images": step * global_batch_size,
                     "perf/batches": batch,
                 },
             )
 
-    print(f"Finished epoch {epoch} training."
+    logger.info(f"Finished epoch {epoch} training.")
+
+
+def save():
+    logger.info("Saving checkpoint.")
+    if not is_master:
+        return
+
+    ckpt = {
+        "model": model.module.state_dict(),
+        "optim": optimizer.state_dict(),
+        "epoch": epoch,
+        "step": step,
+        **val_metrics.compute(),
+    }
+    directory = os.path.join(save_root, run_id)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"ep{epoch}.pt")
+    torch.save(ckpt, path)
+    logger.info("Saved to %s.", path)
+
+    # Only keep n_best_checkpoints and n_latest_checkpoints
+    # Load all checkpoints and select which ones to keep.
+    all_ckpts = {path: ckpt}
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        all_ckpts[path] = torch.load(path, map_location="cpu")
+
+    # Get the best and latest checkpoints
+    best_ckpts = heapq.nlargest(
+        n_best_checkpoints, all_ckpts, key=lambda c: all_ckpts[c][best_metric]
+    )
+    latest_ckpts = heapq.nlargest(
+        n_latest_checkpoints, all_ckpts, key=lambda c: all_ckpts[c]["epoch"]
+    )
+
+    keep = set(best_ckpts) | set(latest_ckpts)
+
+    # If not one of the best or latest, remove it
+    for path in all_ckpts:
+        if path not in keep:
+            os.remove(path)
+            logger.info("Removed %s.", path)
+
+
+def restore():
+    # Restores the latest checkpoint.
+    latest_ckpt = None
+    directory = os.path.join(save_root, run_id)
+    if not os.path.isdir(directory):
+        raise RuntimeError(f"No checkpoint directory at {directory}.")
+
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        ckpt = torch.load(path, map_location=device)
+        if not latest_ckpt or ckpt["epoch"] > latest_ckpt["epoch"]:
+            latest_ckpt = ckpt
+
+    if not latest_ckpt:
+        raise RuntimeError(f"No saved checkpoints in {directory}.")
+
+    global model, optimizer, start, step
+    model.module.load_state_dict(latest_ckpt["model"])
+    optimizer.load_state_dict(latest_ckpt["optim"])
+    # Add one because we save after we finish an epoch
+    start = latest_ckpt["epoch"] + 1
+    step = latest_ckpt["step"]
+
+
+# ---------------
+# Training Script
+# ---------------
 
 
 if __name__ == "__main__":
+    # First epoch
+    start = 0
+
     train_dataloader = build_dataloader(train=True)
     val_dataloader = build_dataloader(train=False)
 
@@ -319,13 +397,10 @@ if __name__ == "__main__":
         num_heads=swin.num_heads,
         window_size=swin.window_size,
     )
-    # model = ConvNeXt(
-    # num_classes=num_classes,
-    # depths=convnext.depths,
-    # dims=convnext.dims,
-    # )
+    # TODO: to compile, we need to use float16, which requires a loss scaler.
+    # compile doesn't support bfloat16: https://github.com/pytorch/pytorch/issues/97016
+    # model = torch.compile(model)
     model.to(device)
-    model = torch.compile(model)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank],
@@ -335,15 +410,17 @@ if __name__ == "__main__":
 
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    # TODO: decouple LR and weight decay
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
     )
 
+    resumed_and_id = [False, None]
     if is_master:
-        wandb.init(
+        run = wandb.init(
             project="computer-vision-pretraining",
             entity="samuelstevens",
+            # TODO: It sucks to repeat all the config options twice.
+            # Can we put the global config options in a dotdict?
             config=dict(
                 img_size=crop_size,
                 num_classes=num_classes,
@@ -360,14 +437,14 @@ if __name__ == "__main__":
                 local_batch_size=local_batch_size,
                 world_size=world_size,
                 # Data options
-                data_path=data_path,
+                data_root=data_root,
                 resize_size=resize_size,
                 crop_size=crop_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 channel_mean=channel_mean,
                 channel_std=channel_std,
-                rand_augment_num_ops=rand_augment.num_ops,
-                rand_augment_magnitude=rand_augment.magnitude,
+                rand_augment_num_ops=rand_augment_num_ops,
+                rand_augment_magnitude=rand_augment_magnitude,
                 mixup_alpha=mixup_alpha,
                 # Training options
                 epochs=epochs,
@@ -376,13 +453,27 @@ if __name__ == "__main__":
                 weight_decay=weight_decay,
                 learning_rate=learning_rate,
                 amp=dtype,
+                debug=False,
             ),
             job_type="pretrain",
+            resume=True,
         )
+        resumed_and_id = run.resumed, run.id
 
-    print("Starting training.")
-    for epoch in range(epochs):
+    # Now non-master processes have resumed and run_id
+    # Refer to https://github.com/pytorch/pytorch/issues/56142
+    # for why we need a variable instead of an anonymous list
+    torch.distributed.broadcast_object_list(resumed_and_id)
+    resumed, run_id = resumed_and_id
+
+    if resumed:
+        assert run_id is not None, "If we resume, we need a run.id"
+        restore()
+
+    logger.info("Starting training from epoch %s.", start)
+    for epoch in range(start, epochs):
         train()
         val()
+        save()
 
-    print("Done.")
+    logger.info("Done.")
