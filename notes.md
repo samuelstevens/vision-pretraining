@@ -1,10 +1,3 @@
-Run with one GPU:
-
-CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc-per-node=1 train.py
-
-Run with four GPUs:
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc-per-node=4 train.py
 
 To Add:
 
@@ -13,8 +6,10 @@ To Add:
 * [done] Gradient accumulation
 * [done] Data augmentation
 * Decoupled weight decay
-* Checkpoints
+  * Decided not to do this because AdamW supports fused.
+* [done] Checkpoints
 * Progressive image resizing
+* torch.compile (needs float16, which needs a scaler)
 * Gradient clipping
 * Channels last
 * Sharpness-aware minimization

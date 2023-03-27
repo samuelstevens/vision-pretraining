@@ -1,4 +1,4 @@
 torch
 torchmetrics
+torchvision
 wandb
-
