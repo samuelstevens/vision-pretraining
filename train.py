@@ -75,8 +75,7 @@ save_root = "/local/scratch/stevens.994/vision/checkpoints"
 log_every = 10
 n_latest_checkpoints = 3
 n_best_checkpoints = 2
-# Needs to be a key in val_metrics
-# Should also be a value we maximize
+# Needs to be a key in val_metrics and a value we maximize (not minimize)
 best_metric = "val/acc1"
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -86,7 +85,7 @@ torch.backends.cudnn.allow_tf32 = True
 # Distributed setup
 # -----------------
 
-is_ddp = int(os.environ.get("LOCAL_RANK", -1)) != -1  # is this a ddp run?
+is_ddp = int(os.environ.get("LOCAL_RANK", -1)) != -1
 if is_ddp:
     torch.distributed.init_process_group(backend="nccl")
     rank = int(os.environ["LOCAL_RANK"])
@@ -114,24 +113,21 @@ log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=log_format)
 logger = logging.getLogger(f"Rank {rank}")
 
+task = "multiclass"
 val_metrics = torchmetrics.MetricCollection(
     {
-        "val/acc1": torchmetrics.Accuracy(
-            task="multiclass", top_k=1, num_classes=num_classes
-        ),
-        "val/acc5": torchmetrics.Accuracy(
-            task="multiclass", top_k=5, num_classes=num_classes
-        ),
+        "val/acc1": torchmetrics.Accuracy(task=task, top_k=1, num_classes=num_classes),
+        "val/acc5": torchmetrics.Accuracy(task=task, top_k=5, num_classes=num_classes),
         "val/cross-entropy": utils.CrossEntropy(),
     }
 ).to(device)
 train_metrics = torchmetrics.MetricCollection(
     {
         "train/acc1": torchmetrics.Accuracy(
-            task="multiclass", top_k=1, num_classes=num_classes
+            task=task, top_k=1, num_classes=num_classes
         ),
         "train/acc5": torchmetrics.Accuracy(
-            task="multiclass", top_k=5, num_classes=num_classes
+            task=task, top_k=5, num_classes=num_classes
         ),
     }
 ).to(device)
@@ -176,9 +172,8 @@ def build_dataloader(*, train):
     transform.extend(common_transforms)
     transform = transforms.Compose(transform)
 
-    dataset = torchvision.datasets.ImageFolder(
-        os.path.join(data_root, split), transform
-    )
+    dataset_path = os.path.join(data_root, split)
+    dataset = torchvision.datasets.ImageFolder(dataset_path, transform)
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
         drop_last=drop_last,
@@ -193,6 +188,7 @@ def build_dataloader(*, train):
         sampler=sampler,
         drop_last=drop_last,
         num_workers=8,
+        # TODO: Evaluate whether this helps throughput or not on A100 and on A6000.
         pin_memory=True,
         persistent_workers=True,
     )
@@ -281,7 +277,6 @@ def train():
         train_metrics(outputs, targets)
 
         loss = loss_fn(outputs, soft_targets)
-        # TODO: do I need to divide the loss by gradient_accumulation_steps?
         loss = loss / gradient_accumulation_steps
         scaler.scale(loss).backward()
 
@@ -291,8 +286,7 @@ def train():
             param_group["lr"] = lr
 
         if will_step:
-            # Clip gradients. If you remove the division by gradient_accumulation_steps,
-            # you might need to adjust grad_clip?
+            # Clip gradients
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 grad = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -309,26 +303,25 @@ def train():
             # Need to use **{} because train/lr isn't a valid variable name
             # We can use loss.item() because we don't need to sync it across
             # all processes since it's going to be noisy anyways.
-            wandb.log(
-                {
-                    **train_metrics.compute(),
-                    "train/lr": lr,
-                    "train/cross-entropy": loss.item(),
-                    "train/step": step,
-                    "perf/total-images": step * global_batch_size,
-                    "perf/batches": batch,
-                    "train/grad": grad,
-                },
-            )
+            metrics = {
+                **train_metrics.compute(),
+                "train/lr": lr,
+                "train/cross-entropy": loss.item(),
+                "train/step": step,
+                "perf/total-images": step * global_batch_size,
+                "perf/batches": batch,
+                "train/grad": grad,
+            }
+            wandb.log(metrics)
 
     logger.info(f"Finished epoch {epoch} training.")
 
 
 def save():
-    logger.info("Saving checkpoint.")
     if not is_master:
         return
 
+    logger.info("Saving checkpoint.")
     ckpt = {
         "model": model.module.state_dict(),
         "optim": optimizer.state_dict(),
@@ -342,7 +335,9 @@ def save():
     torch.save(ckpt, path)
     logger.info("Saved to %s.", path)
 
-    # Only keep n_best_checkpoints and n_latest_checkpoints
+    # Prune checkpoints: keep n_best_checkpoints and n_latest_checkpoints
+    # ------------------
+
     # Load all checkpoints and select which ones to keep.
     all_ckpts = {path: ckpt}
     for name in os.listdir(directory):
@@ -363,7 +358,7 @@ def save():
     for path in all_ckpts:
         if path in latest_ckpts:
             logger.info(
-                "Keeping %s because it is in the top %d for %s.",
+                "Keep %s. It's the top %d for %s.",
                 path,
                 n_best_checkpoints,
                 best_metric,
@@ -371,11 +366,7 @@ def save():
             continue
 
         if path in best_ckpts:
-            logger.info(
-                "Keeping %s because it is in the latest %d epochs.",
-                path,
-                n_latest_checkpoints,
-            )
+            logger.info("Keep %s. It's in %d latest.", path, n_latest_checkpoints)
             continue
 
         os.remove(path)
@@ -424,12 +415,11 @@ if __name__ == "__main__":
         embed_dim=convnext.embed_dim,
         depths=convnext.depths,
     )
-    model.to(memory_format=memory_format)
-
+    model.to(device, memory_format=memory_format)
     # compile doesn't support bfloat16: https://github.com/pytorch/pytorch/issues/97016
     if dtype != "bfloat16":
         model = torch.compile(model)
-    model.to(device)
+
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[rank],
@@ -487,7 +477,7 @@ if __name__ == "__main__":
                 debug=False,
             ),
             job_type="pretrain",
-            resume=True,
+            resume=False,
         )
         resumed_and_id = run.resumed, run.id
 
