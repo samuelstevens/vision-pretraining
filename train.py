@@ -339,17 +339,33 @@ def save():
     best_ckpts = heapq.nlargest(
         n_best_checkpoints, all_ckpts, key=lambda c: all_ckpts[c][best_metric]
     )
+    best_ckpts = set(best_ckpts)
     latest_ckpts = heapq.nlargest(
         n_latest_checkpoints, all_ckpts, key=lambda c: all_ckpts[c]["epoch"]
     )
-
-    keep = set(best_ckpts) | set(latest_ckpts)
+    latest_ckpts = set(latest_ckpts)
 
     # If not one of the best or latest, remove it
     for path in all_ckpts:
-        if path not in keep:
-            os.remove(path)
-            logger.info("Removed %s.", path)
+        if path in latest_ckpts:
+            logger.info(
+                "Keeping %s because it is in the top %d for %s.",
+                path,
+                n_best_checkpoints,
+                best_metric,
+            )
+            continue
+
+        if path in best_ckpts:
+            logger.info(
+                "Keeping %s because it is in the latest %d epochs.",
+                path,
+                n_latest_checkpoints,
+            )
+            continue
+
+        os.remove(path)
+        logger.info("Removed %s.", path)
 
 
 def restore():
