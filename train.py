@@ -50,7 +50,8 @@ swin = utils.DotDict(
 )
 convnext = utils.DotDict(
     depths=(3, 3, 9, 3),
-    dims=(96, 192, 384, 768),
+    embed_dim=(96, 192, 384, 768),
+    drop_path_rate=0.1,
 )
 
 # Training
@@ -417,16 +418,14 @@ if __name__ == "__main__":
     train_dataloader = build_dataloader(train=True)
     val_dataloader = build_dataloader(train=False)
 
-    model = SwinTransformerV2(
-        img_size=swin.img_size,
+    model = ConvNeXt(
         num_classes=num_classes,
-        drop_path_rate=swin.drop_path_rate,
-        embed_dim=swin.embed_dim,
-        depths=swin.depths,
-        num_heads=swin.num_heads,
-        window_size=swin.window_size,
+        drop_path_rate=convnext.drop_path_rate,
+        embed_dim=convnext.embed_dim,
+        depths=convnext.depths,
     )
-    # TODO: to compile, we need to use float16, which requires a loss scaler.
+    model.to(memory_format=memory_format)
+
     # compile doesn't support bfloat16: https://github.com/pytorch/pytorch/issues/97016
     if dtype != "bfloat16":
         model = torch.compile(model)
@@ -459,14 +458,10 @@ if __name__ == "__main__":
                 img_size=crop_size,
                 num_classes=num_classes,
                 # model options
-                model="swinv2",
-                drop_path_rate=swin.drop_path_rate,
-                embed_dim=swin.embed_dim,
-                depths=swin.depths,
-                num_heads=swin.num_heads,
-                window_size=swin.window_size,
-                # depths=convnext.depths,
-                # embed_dim=convnext.dims,
+                model="convnext",
+                depths=convnext.depths,
+                embed_dim=convnext.embed_dim,
+                drop_path_rate=convnext.drop_path_rate,
                 global_batch_size=global_batch_size,
                 local_batch_size=local_batch_size,
                 world_size=world_size,
