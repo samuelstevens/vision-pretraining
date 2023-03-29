@@ -57,14 +57,18 @@ convnext = utils.DotDict(
 label_smoothing = 0.1
 learning_rate = 3e-4
 weight_decay = 0.01
+grad_clip = 2.0
 epochs = 300
 warmup_steps = 1000
+# Other option is torch.contiguous_format; use channels_last for convnets
+memory_format = torch.channels_last
 
-dtype = "bfloat16"
+dtype = "float16"
 # PyTorch dtype
 ptdtype = getattr(torch, dtype)
-# If we change from bfloat16 to float16, we might need a grad scaler
 ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+# Don't need scaler for bfloat16 because it's higher range, lower precision.
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 save_root = "/local/scratch/stevens.994/vision/checkpoints"
 log_every = 10
@@ -276,8 +280,9 @@ def train():
         train_metrics(outputs, targets)
 
         loss = loss_fn(outputs, soft_targets)
+        # TODO: do I need to divide the loss by gradient_accumulation_steps?
         loss = loss / gradient_accumulation_steps
-        loss.backward()
+        scaler.scale(loss).backward()
 
         # Update the learning rate while we wait for the forward pass
         lr = get_lr()
@@ -285,14 +290,21 @@ def train():
             param_group["lr"] = lr
 
         if will_step:
-            optimizer.step()
-            # This has to be after optimizer.step().
-            optimizer.zero_grad()
+            # Clip gradients. If you remove the division by gradient_accumulation_steps,
+            # you might need to adjust grad_clip?
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                grad = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # Step optimizer
+            scaler.step(optimizer)
+            scaler.update()
+            # This has to be after optimizer.step() or scaler.step(optimizer)
+            optimizer.zero_grad(set_to_none=True)
             step += 1
 
         train_metrics.compute()
 
-        if batch % log_every == 0 and is_master:
+        if batch % (log_every * gradient_accumulation_steps) == 0 and is_master:
             # Need to use **{} because train/lr isn't a valid variable name
             # We can use loss.item() because we don't need to sync it across
             # all processes since it's going to be noisy anyways.
@@ -304,6 +316,7 @@ def train():
                     "train/step": step,
                     "perf/total-images": step * global_batch_size,
                     "perf/batches": batch,
+                    "train/grad": grad,
                 },
             )
 
@@ -415,7 +428,8 @@ if __name__ == "__main__":
     )
     # TODO: to compile, we need to use float16, which requires a loss scaler.
     # compile doesn't support bfloat16: https://github.com/pytorch/pytorch/issues/97016
-    # model = torch.compile(model)
+    if dtype != "bfloat16":
+        model = torch.compile(model)
     model.to(device)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -427,7 +441,11 @@ if __name__ == "__main__":
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, fused=True
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        # fused doesn't work with channels_last (bug? not sure)
+        fused=(memory_format != torch.channels_last),
     )
 
     resumed_and_id = [False, None]
@@ -469,6 +487,8 @@ if __name__ == "__main__":
                 weight_decay=weight_decay,
                 learning_rate=learning_rate,
                 amp=dtype,
+                grad_clip=grad_clip,
+                memory_format=str(memory_format),
                 debug=False,
             ),
             job_type="pretrain",
