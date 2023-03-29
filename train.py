@@ -13,9 +13,9 @@ import os
 import torch
 import torchmetrics
 import torchvision
-from torch import nn
 from torchvision import transforms
 
+import algorithms
 import utils
 import wandb
 from convnext import ConvNeXt
@@ -25,8 +25,7 @@ from swinv2 import SwinTransformerV2
 # Config
 # ------
 
-num_classes = 10000
-
+num_classes = 10_000
 
 data_root = "/local/scratch/cv_datasets/inat21/raw"
 resize_size = (256, 256)
@@ -64,6 +63,11 @@ warmup_steps = 1000
 # Other option is torch.contiguous_format; use channels_last for convnets
 memory_format = torch.channels_last
 
+pr_init_scale = 0.5
+pr_init_steps = 100_000
+pr_warmup_steps = 100_000
+pr_size_inc = 4
+
 dtype = "float16"
 # PyTorch dtype
 ptdtype = getattr(torch, dtype)
@@ -95,7 +99,7 @@ if is_ddp:
     torch.distributed.barrier()
 else:
     rank = 0
-    world_size = 0
+    world_size = 1
     is_master = True
     seed_offset = 0
 
@@ -194,35 +198,6 @@ def build_dataloader(*, train):
     )
 
 
-class Mixup(nn.Module):
-    def __init__(self, alpha):
-        super().__init__()
-        self.dist = torch.distributions.Beta(torch.tensor(alpha), torch.tensor(alpha))
-
-    @classmethod
-    @torch.no_grad()
-    def one_hot(self, y):
-        # Make sure y.shape = (B, 1)
-        y = y.long().view(-1, 1)
-        batch, _ = y.shape
-        # Fill with 0.0, then set to 1 in the target column
-        return torch.full((batch, num_classes), 0.0, device=y.device).scatter(1, y, 1.0)
-
-    @torch.no_grad()
-    def forward(self, inputs, targets):
-        lam = self.dist.sample()
-        targets = self.one_hot(targets)
-
-        inputs_flipped = inputs.flip(0).mul_(1 - lam)
-        targets_flipped = targets.flip(0).mul_(1 - lam)
-
-        # Do input ops in-place to save memory.
-        inputs.mul_(lam).add_(inputs_flipped)
-        targets.mul_(lam).add_(targets_flipped)
-
-        return inputs, targets
-
-
 # --------
 # Training
 # --------
@@ -258,7 +233,7 @@ def train():
     logger.info(f"Starting epoch {epoch} training.")
     global step
     model.train()
-    mixup = Mixup(alpha=mixup_alpha)
+    mixup = algorithms.Mixup(alpha=mixup_alpha, num_classes=num_classes)
 
     for batch, (inputs, targets) in enumerate(train_dataloader):
         # Whether we will actually do an optimization step
@@ -268,6 +243,7 @@ def train():
 
         inputs, targets = inputs.to(device), targets.to(device)
         inputs, soft_targets = mixup(inputs, targets)
+        inputs, scale = resizer(inputs)
 
         with ctx:
             outputs = model(inputs)
@@ -311,6 +287,7 @@ def train():
                 "perf/total-images": step * global_batch_size,
                 "perf/batches": batch,
                 "train/grad": grad,
+                "train/img-scale": scale,
             }
             wandb.log(metrics)
 
@@ -323,7 +300,7 @@ def save():
 
     logger.info("Saving checkpoint.")
     ckpt = {
-        "model": model.module.state_dict(),
+        "model": model_without_ddp.state_dict(),
         "optim": optimizer.state_dict(),
         "epoch": epoch,
         "step": step,
@@ -356,7 +333,7 @@ def save():
 
     # If not one of the best or latest, remove it
     for path in all_ckpts:
-        if path in latest_ckpts:
+        if path in best_ckpts:
             logger.info(
                 "Keep %s. It's the top %d for %s.",
                 path,
@@ -365,7 +342,7 @@ def save():
             )
             continue
 
-        if path in best_ckpts:
+        if path in latest_ckpts:
             logger.info("Keep %s. It's in %d latest.", path, n_latest_checkpoints)
             continue
 
@@ -390,7 +367,7 @@ def restore():
         raise RuntimeError(f"No saved checkpoints in {directory}.")
 
     global model, optimizer, start, step
-    model.module.load_state_dict(latest_ckpt["model"])
+    model_without_ddp.load_state_dict(latest_ckpt["model"])
     optimizer.load_state_dict(latest_ckpt["optim"])
     # Add one because we save after we finish an epoch
     start = latest_ckpt["epoch"] + 1
@@ -415,17 +392,19 @@ if __name__ == "__main__":
         embed_dim=convnext.embed_dim,
         depths=convnext.depths,
     )
+    model_without_ddp = model
     model.to(device, memory_format=memory_format)
     # compile doesn't support bfloat16: https://github.com/pytorch/pytorch/issues/97016
     if dtype != "bfloat16":
         model = torch.compile(model)
 
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[rank],
-        broadcast_buffers=False,
-        find_unused_parameters=False,
-    )
+    if is_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
 
     loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -442,8 +421,6 @@ if __name__ == "__main__":
         run = wandb.init(
             project="computer-vision-pretraining",
             entity="samuelstevens",
-            # TODO: It sucks to repeat all the config options twice.
-            # Can we put the global config options in a dotdict?
             config=dict(
                 img_size=crop_size,
                 num_classes=num_classes,
@@ -455,7 +432,7 @@ if __name__ == "__main__":
                 global_batch_size=global_batch_size,
                 local_batch_size=local_batch_size,
                 world_size=world_size,
-                # Data options
+                # data options
                 data_root=data_root,
                 resize_size=resize_size,
                 crop_size=crop_size,
@@ -465,12 +442,17 @@ if __name__ == "__main__":
                 rand_augment_num_ops=rand_augment_num_ops,
                 rand_augment_magnitude=rand_augment_magnitude,
                 mixup_alpha=mixup_alpha,
-                # Training options
+                # training options
                 epochs=epochs,
                 label_smoothing=label_smoothing,
                 warmup_steps=warmup_steps,
                 weight_decay=weight_decay,
                 learning_rate=learning_rate,
+                # progressive resizing options
+                pr_init_scale=pr_init_scale,
+                pr_init_steps=pr_init_steps,
+                pr_warmup_steps=pr_warmup_steps,
+                pr_size_inc=pr_size_inc,
                 amp=dtype,
                 grad_clip=grad_clip,
                 memory_format=str(memory_format),
@@ -484,12 +466,20 @@ if __name__ == "__main__":
     # Now non-master processes have resumed and run_id
     # Refer to https://github.com/pytorch/pytorch/issues/56142
     # for why we need a variable instead of an anonymous list
-    torch.distributed.broadcast_object_list(resumed_and_id)
+    if is_ddp:
+        torch.distributed.broadcast_object_list(resumed_and_id)
     resumed, run_id = resumed_and_id
 
     if resumed:
         assert run_id is not None, "If we resume, we need a run.id"
         restore()
+
+    resizer = algorithms.ProgressiveResizing(
+        init_scale=pr_init_scale,
+        init_steps=pr_init_steps,
+        warmup_steps=pr_warmup_steps,
+        size_inc=pr_size_inc,
+    )
 
     logger.info("Starting training from epoch %s.", start)
     for epoch in range(start, epochs):
