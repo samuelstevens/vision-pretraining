@@ -5,6 +5,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --partition=gpu
 #SBATCH --ntasks-per-node=48
+#SBATCH --signal=B:USR1@60
 
 source $HOME/projects/vision/.venv/bin/activate
 
