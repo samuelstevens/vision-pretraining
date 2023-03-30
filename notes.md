@@ -13,7 +13,7 @@
 * [done] Gradient clipping
 * [done] torch.compile (needs float16, which needs a scaler)
 * [done] Channels last
-* Progressive image resizing
+* [done] Progressive image resizing
 * EMA
 * Sharpness-aware minimization
 

@@ -10,18 +10,18 @@ class Mixup(nn.Module):
         self.num_classes = num_classes
 
     @torch.no_grad()
-    def one_hot(self, y):
+    def one_hot(self, y, num_classes):
         # Make sure y.shape = (B, 1)
         y = y.long().view(-1, 1)
         B, _ = y.shape
         # Fill with 0.0, then set to 1 in the target column
-        empty = torch.full((B, self.num_classes), 0.0, device=y.device)
+        empty = torch.full((B, num_classes), 0.0, device=y.device)
         return empty.scatter(1, y, 1.0)
 
     @torch.no_grad()
     def forward(self, inputs, targets):
         lam = self.dist.sample()
-        targets = self.one_hot(targets)
+        targets = self.one_hot(targets, self.num_classes)
 
         inputs_flipped = inputs.flip(0).mul_(1 - lam)
         targets_flipped = targets.flip(0).mul_(1 - lam)
@@ -55,9 +55,15 @@ class ProgressiveResizing(nn.Module):
         elif self.step < self.init_steps + self.warmup_steps:
             scale = self.init_scale + (self.step - self.init_steps) * self.slope
         else:
-            scale = 1.0
+            return inputs, 1.0
 
         B, C, W, H = inputs.shape
         assert C == 3, "inputs changed their format!"
         width, height = self.round(W * scale), self.round(H * scale)
         return F.interpolate(inputs, size=(width, height), mode="nearest"), scale
+
+    def state_dict(self):
+        return dict(step=self.step)
+
+    def load_state_dict(self, state_dict):
+        self.step = state_dict["step"]

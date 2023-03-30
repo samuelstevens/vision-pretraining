@@ -64,8 +64,8 @@ warmup_steps = 1000
 memory_format = torch.channels_last
 
 pr_init_scale = 0.5
-pr_init_steps = 100_000
-pr_warmup_steps = 100_000
+pr_init_steps = 10_000
+pr_warmup_steps = 90_000
 pr_size_inc = 4
 
 dtype = "float16"
@@ -109,32 +109,26 @@ torch.cuda.set_device(device)
 local_batch_size = global_batch_size // world_size // gradient_accumulation_steps
 step = 0
 
-# -------
-# Logging
-# -------
+# -------------------
+# Logging and metrics
+# -------------------
 
 log_format = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=log_format)
 logger = logging.getLogger(f"Rank {rank}")
 
 task = "multiclass"
-val_metrics = torchmetrics.MetricCollection(
-    {
-        "val/acc1": torchmetrics.Accuracy(task=task, top_k=1, num_classes=num_classes),
-        "val/acc5": torchmetrics.Accuracy(task=task, top_k=5, num_classes=num_classes),
-        "val/cross-entropy": utils.CrossEntropy(),
-    }
-).to(device)
-train_metrics = torchmetrics.MetricCollection(
-    {
-        "train/acc1": torchmetrics.Accuracy(
-            task=task, top_k=1, num_classes=num_classes
-        ),
-        "train/acc5": torchmetrics.Accuracy(
-            task=task, top_k=5, num_classes=num_classes
-        ),
-    }
-).to(device)
+val_metrics = {
+    "val/acc1": torchmetrics.Accuracy(task=task, top_k=1, num_classes=num_classes),
+    "val/acc5": torchmetrics.Accuracy(task=task, top_k=5, num_classes=num_classes),
+    "val/cross-entropy": utils.CrossEntropy(),
+}
+val_metrics = torchmetrics.MetricCollection(val_metrics).to(device)
+train_metrics = {
+    "train/acc1": torchmetrics.Accuracy(task=task, top_k=1, num_classes=num_classes),
+    "train/acc5": torchmetrics.Accuracy(task=task, top_k=5, num_classes=num_classes),
+}
+train_metrics = torchmetrics.MetricCollection(train_metrics).to(device)
 
 assert best_metric in val_metrics, f"Can't optimize for {best_metric}!"
 
@@ -302,6 +296,7 @@ def save():
     ckpt = {
         "model": model_without_ddp.state_dict(),
         "optim": optimizer.state_dict(),
+        "resizer": resizer.state_dict(),
         "epoch": epoch,
         "step": step,
         **val_metrics.compute(),
@@ -335,7 +330,7 @@ def save():
     for path in all_ckpts:
         if path in best_ckpts:
             logger.info(
-                "Keep %s. It's the top %d for %s.",
+                "Keep %s. It's in the top %d for %s.",
                 path,
                 n_best_checkpoints,
                 best_metric,
@@ -343,7 +338,7 @@ def save():
             continue
 
         if path in latest_ckpts:
-            logger.info("Keep %s. It's in %d latest.", path, n_latest_checkpoints)
+            logger.info("Keep %s. It's in the %d latest.", path, n_latest_checkpoints)
             continue
 
         os.remove(path)
@@ -366,9 +361,10 @@ def restore():
     if not latest_ckpt:
         raise RuntimeError(f"No saved checkpoints in {directory}.")
 
-    global model, optimizer, start, step
+    global model, optimizer, start, step, resizer
     model_without_ddp.load_state_dict(latest_ckpt["model"])
     optimizer.load_state_dict(latest_ckpt["optim"])
+    resizer.load_state_dict(latest_ckpt["resizer"])
     # Add one because we save after we finish an epoch
     start = latest_ckpt["epoch"] + 1
     step = latest_ckpt["step"]
@@ -416,6 +412,13 @@ if __name__ == "__main__":
         fused=(memory_format != torch.channels_last),
     )
 
+    resizer = algorithms.ProgressiveResizing(
+        init_scale=pr_init_scale,
+        init_steps=pr_init_steps,
+        warmup_steps=pr_warmup_steps,
+        size_inc=pr_size_inc,
+    )
+
     resumed_and_id = [False, None]
     if is_master:
         run = wandb.init(
@@ -460,6 +463,7 @@ if __name__ == "__main__":
             ),
             job_type="pretrain",
             resume=False,
+            tags=[],
         )
         resumed_and_id = run.resumed, run.id
 
@@ -473,13 +477,6 @@ if __name__ == "__main__":
     if resumed:
         assert run_id is not None, "If we resume, we need a run.id"
         restore()
-
-    resizer = algorithms.ProgressiveResizing(
-        init_scale=pr_init_scale,
-        init_steps=pr_init_steps,
-        warmup_steps=pr_warmup_steps,
-        size_inc=pr_size_inc,
-    )
 
     logger.info("Starting training from epoch %s.", start)
     for epoch in range(start, epochs):
